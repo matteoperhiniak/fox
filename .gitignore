@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+fox_report.*
+.fox/

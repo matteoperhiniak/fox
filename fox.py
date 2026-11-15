@@ -927,7 +927,7 @@ async def update_cve_cache(cpes: list[str], api_key: Optional[str] = None):
     async with httpx.AsyncClient(headers=headers, timeout=60) as client:
         for cpe in cpes:
             url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-            params = {"cpeName": cpe, "resultsPerPage": 2000}
+            params = {"virtualMatchString": cpe, "resultsPerPage": 2000}
             try:
                 r = await client.get(url, params=params)
                 if r.status_code != 200:
@@ -2181,19 +2181,19 @@ def main():
 
     if args.mode == "update-cve":
         cpes = [
-            "cpe:2.3:a:wordpress:wordpress",
-            "cpe:2.3:a:drupal:drupal",
-            "cpe:2.3:a:joomla:joomla",
-            "cpe:2.3:a:laravel:laravel",
-            "cpe:2.3:a:djangoproject:django",
-            "cpe:2.3:a:vercel:next.js",
-            "cpe:2.3:a:facebook:react",
-            "cpe:2.3:a:google:angular",
-            "cpe:2.3:a:vmware:spring_framework",
-            "cpe:2.3:a:nginx:nginx",
-            "cpe:2.3:a:apache:http_server",
-            "cpe:2.3:a:microsoft:internet_information_services",
-            "cpe:2.3:a:php:php",
+            "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:drupal:drupal:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:joomla:joomla:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:laravel:laravel:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:djangoproject:django:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:vercel:next.js:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:facebook:react:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:google:angular:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:vmware:spring_framework:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:nginx:nginx:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:microsoft:internet_information_services:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:php:php:*:*:*:*:*:*:*:*",
         ]
         print(f"{CYAN}[*]{RESET} updating CVE cache from NVD")
         try:
