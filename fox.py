@@ -42,8 +42,22 @@ try:
 except ImportError:
     HAS_YAML = False
 
+try:
+    import questionary
+    HAS_QUESTIONARY = True
+except ImportError:
+    HAS_QUESTIONARY = False
 
-VERSION = "1.0"
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+VERSION = "2.0"
 
 RESET = "\033[0m"
 DIM = "\033[38;5;245m"
@@ -52,6 +66,8 @@ YELLOW = "\033[93m"
 CYAN = "\033[96m"
 RED = "\033[91m"
 BOLD = "\033[1m"
+
+console = Console() if HAS_RICH else None
 
 
 def now_iso() -> str:
@@ -78,6 +94,31 @@ def short_body(body: str, limit: int = 600) -> str:
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()
+
+
+def simhash(text: str, bits: int = 64) -> int:
+    if not text:
+        return 0
+    tokens = re.findall(r"\w+", text.lower())
+    if not tokens:
+        return 0
+    v = [0] * bits
+    for token in tokens:
+        h = int(hashlib.md5(token.encode()).hexdigest(), 16)
+        for i in range(bits):
+            if h & (1 << i):
+                v[i] += 1
+            else:
+                v[i] -= 1
+    result = 0
+    for i in range(bits):
+        if v[i] > 0:
+            result |= 1 << i
+    return result
+
+
+def hamming_distance(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
 
 
 def severity_rank(sev: str) -> int:
@@ -377,6 +418,7 @@ class Engine:
         self.store = store
         self.findings: dict[str, Finding] = {}
         self.merged_evidence: dict[str, list[Evidence]] = {}
+        self.soft404_fingerprints: dict[str, int] = {}
 
     def add(self, finding: Finding) -> bool:
         existing = self.findings.get(finding.fingerprint)
@@ -406,11 +448,59 @@ def risk_score(finding: Finding, asset_criticality: int = 3) -> float:
     return round(b * c * a * exposure, 1)
 
 
-BB_CANARIES = {
-    "xss_html": "FOXBB_XSS_7F3A91",
-    "ssti": "FOXBB_SSTI_91B2E7",
-    "redirect": "https://example.invalid/foxbb-redirect-7f3a",
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_CONFIG = {
+    "canaries": {
+        "xss_html": "FOXBB_XSS_7F3A91",
+        "ssti": "FOXBB_SSTI_91B2E7",
+        "redirect": "https://example.invalid/foxbb-redirect-7f3a",
+    },
+    "timeouts": {
+        "http": 10.0,
+        "dns": 3.0,
+        "tcp": 1.5,
+    },
+    "limits": {
+        "max_pages": 50,
+        "max_params": 10,
+        "max_endpoints": 100,
+        "max_active_probes": 100,
+    },
+    "severity_overrides": {},
+    "excluded_paths": [],
 }
+
+
+def load_config(path: Optional[str] = None) -> dict[str, Any]:
+    config = DEFAULT_CONFIG.copy()
+    if not path:
+        path = os.environ.get("FOX_CONFIG", "fox.yaml")
+    p = Path(path)
+    if p.exists() and HAS_YAML:
+        try:
+            user = yaml.safe_load(p.read_text())
+            if isinstance(user, dict):
+                for k, v in user.items():
+                    if isinstance(v, dict) and k in config:
+                        config[k].update(v)
+                    else:
+                        config[k] = v
+        except Exception:
+            pass
+    return config
+
+
+CONFIG = load_config()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKERS / PATTERNS
+# ══════════════════════════════════════════════════════════════════════════════
+
+BB_CANARIES = CONFIG["canaries"]
 
 SQL_SYNTAX_PROBES = ["'", '"', "')", '")']
 
@@ -482,25 +572,10 @@ COMMON_EXPOSURES = [
 ]
 
 SENSITIVE_PATHS = [
-    "/robots.txt",
-    "/sitemap.xml",
-    "/security.txt",
-    "/.well-known/security.txt",
-    "/openapi.json",
-    "/swagger.json",
-    "/swagger/v1/swagger.json",
-    "/api-docs",
-    "/v3/api-docs",
-    "/graphql",
-    "/health",
-    "/healthz",
-    "/ready",
-    "/live",
-    "/status",
-    "/metrics",
-    "/debug",
-    "/actuator",
-    "/actuator/health",
+    "/robots.txt", "/sitemap.xml", "/security.txt", "/.well-known/security.txt",
+    "/openapi.json", "/swagger.json", "/swagger/v1/swagger.json", "/api-docs",
+    "/v3/api-docs", "/graphql", "/health", "/healthz", "/ready", "/live",
+    "/status", "/metrics", "/debug", "/actuator", "/actuator/health",
 ]
 
 HEADER_TESTS = {
@@ -513,94 +588,36 @@ HEADER_TESTS = {
 }
 
 TECH_CONFIDENCE = {
-    "Next.js": {
-        "markers": ["__next_data__", "/_next/static/"],
-        "weights": [70, 30],
-        "min_context": ["structural", "structural"],
-    },
-    "Nuxt": {
-        "markers": ["__nuxt__", "/_nuxt/"],
-        "weights": [70, 30],
-        "min_context": ["structural", "structural"],
-    },
-    "WordPress": {
-        "markers": ["wp-content", "wp-includes", "wordpress"],
-        "weights": [40, 30, 30],
-        "min_context": ["structural", "structural", "body"],
-    },
-    "Drupal": {
-        "markers": ["drupalsettings", "/sites/default/"],
-        "weights": [60, 40],
-        "min_context": ["structural", "structural"],
-    },
-    "Laravel": {
-        "markers": ["laravel_session", "x-powered-by: php"],
-        "weights": [50, 50],
-        "min_context": ["structural", "structural"],
-        "min_confidence": 50,
-    },
-    "Django": {
-        "markers": ["csrfmiddlewaretoken", "django"],
-        "weights": [60, 40],
-        "min_context": ["structural", "body"],
-        "min_confidence": 50,
-    },
-    "Spring": {
-        "markers": ["jsessionid", "x-application-context"],
-        "weights": [40, 60],
-        "min_context": ["structural", "structural"],
-    },
-    "React": {
-        "markers": ["react-dom", "_reactroot", "data-reactroot"],
-        "weights": [50, 30, 20],
-        "min_context": ["structural", "structural", "structural"],
-    },
-    "Vue": {
-        "markers": ["__vue__", "data-v-"],
-        "weights": [50, 50],
-        "min_context": ["structural", "structural"],
-    },
-    "Angular": {
-        "markers": ["ng-version", "ng-app"],
-        "weights": [50, 50],
-        "min_context": ["structural", "structural"],
-    },
-    "Joomla": {
-        "markers": ["joomla", "/media/system/js/"],
-        "weights": [50, 50],
-        "min_context": ["body", "structural"],
-    },
-    "ASP.NET": {
-        "markers": ["asp.net", "__viewstate", ".aspx"],
-        "weights": [40, 40, 20],
-        "min_context": ["structural", "structural", "structural"],
-    },
-    "Express": {
-        "markers": ["x-powered-by: express"],
-        "weights": [100],
-        "min_context": ["structural"],
-    },
-    "PHP": {
-        "markers": ["x-powered-by: php", "phpsessid"],
-        "weights": [50, 50],
-        "min_context": ["structural", "structural"],
-    },
+    "Next.js": {"markers": ["__next_data__", "/_next/static/"], "weights": [70, 30], "min_context": ["structural", "structural"]},
+    "Nuxt": {"markers": ["__nuxt__", "/_nuxt/"], "weights": [70, 30], "min_context": ["structural", "structural"]},
+    "WordPress": {"markers": ["wp-content", "wp-includes", "wordpress"], "weights": [40, 30, 30], "min_context": ["structural", "structural", "body"]},
+    "Drupal": {"markers": ["drupalsettings", "/sites/default/"], "weights": [60, 40], "min_context": ["structural", "structural"]},
+    "Laravel": {"markers": ["laravel_session", "x-powered-by: php"], "weights": [50, 50], "min_context": ["structural", "structural"], "min_confidence": 50},
+    "Django": {"markers": ["csrfmiddlewaretoken", "django"], "weights": [60, 40], "min_context": ["structural", "body"], "min_confidence": 50},
+    "Spring": {"markers": ["jsessionid", "x-application-context"], "weights": [40, 60], "min_context": ["structural", "structural"]},
+    "React": {"markers": ["react-dom", "_reactroot", "data-reactroot"], "weights": [50, 30, 20], "min_context": ["structural", "structural", "structural"]},
+    "Vue": {"markers": ["__vue__", "data-v-"], "weights": [50, 50], "min_context": ["structural", "structural"]},
+    "Angular": {"markers": ["ng-version", "ng-app"], "weights": [50, 50], "min_context": ["structural", "structural"]},
+    "Joomla": {"markers": ["joomla", "/media/system/js/"], "weights": [50, 50], "min_context": ["body", "structural"]},
+    "ASP.NET": {"markers": ["asp.net", "__viewstate", ".aspx"], "weights": [40, 40, 20], "min_context": ["structural", "structural", "structural"]},
+    "Express": {"markers": ["x-powered-by: express"], "weights": [100], "min_context": ["structural"]},
+    "PHP": {"markers": ["x-powered-by: php", "phpsessid"], "weights": [50, 50], "min_context": ["structural", "structural"]},
 }
 
 TECH_CPE_MAP = {
-    "WordPress": "cpe:2.3:a:wordpress:wordpress",
-    "Drupal": "cpe:2.3:a:drupal:drupal",
-    "Joomla": "cpe:2.3:a:joomla:joomla",
-    "Laravel": "cpe:2.3:a:laravel:laravel",
-    "Django": "cpe:2.3:a:djangoproject:django",
-    "Next.js": "cpe:2.3:a:vercel:next.js",
-    "React": "cpe:2.3:a:facebook:react",
-    "Angular": "cpe:2.3:a:google:angular",
-    "Spring": "cpe:2.3:a:vmware:spring_framework",
-    "nginx": "cpe:2.3:a:nginx:nginx",
-    "Apache": "cpe:2.3:a:apache:http_server",
-    "IIS": "cpe:2.3:a:microsoft:internet_information_services",
-    "PHP": "cpe:2.3:a:php:php",
+    "WordPress": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+    "Drupal": "cpe:2.3:a:drupal:drupal:*:*:*:*:*:*:*:*",
+    "Joomla": "cpe:2.3:a:joomla:joomla:*:*:*:*:*:*:*:*",
+    "Laravel": "cpe:2.3:a:laravel:laravel:*:*:*:*:*:*:*:*",
+    "Django": "cpe:2.3:a:djangoproject:django:*:*:*:*:*:*:*:*",
+    "Next.js": "cpe:2.3:a:vercel:next.js:*:*:*:*:*:*:*:*",
+    "React": "cpe:2.3:a:facebook:react:*:*:*:*:*:*:*:*",
+    "Angular": "cpe:2.3:a:google:angular:*:*:*:*:*:*:*:*",
+    "Spring": "cpe:2.3:a:vmware:spring_framework:*:*:*:*:*:*:*:*",
+    "nginx": "cpe:2.3:a:nginx:nginx:*:*:*:*:*:*:*:*",
+    "Apache": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+    "IIS": "cpe:2.3:a:microsoft:internet_information_services:*:*:*:*:*:*:*:*",
+    "PHP": "cpe:2.3:a:php:php:*:*:*:*:*:*:*:*",
 }
 
 WAF_MARKERS = {
@@ -637,26 +654,16 @@ SERVICE_SIGNATURES = {
 }
 
 CLOUD_CNAME_MARKERS = {
-    "amazonaws.com": "AWS",
-    "cloudfront.net": "AWS CloudFront",
-    "elb.amazonaws.com": "AWS ELB",
-    "azurewebsites.net": "Azure App Service",
-    "cloudapp.net": "Azure",
-    "blob.core.windows.net": "Azure Blob",
-    "googleapis.com": "Google",
-    "googlehosted.com": "Google",
-    "herokuapp.com": "Heroku",
-    "herokudns.com": "Heroku",
-    "netlify.app": "Netlify",
-    "vercel.app": "Vercel",
-    "pages.dev": "Cloudflare Pages",
-    "workers.dev": "Cloudflare Workers",
-    "github.io": "GitHub Pages",
-    "gitlab.io": "GitLab Pages",
-    "fastly.net": "Fastly",
-    "akamai.net": "Akamai",
-    "azureedge.net": "Azure CDN",
-    "myshopify.com": "Shopify",
+    "amazonaws.com": "AWS", "cloudfront.net": "AWS CloudFront",
+    "elb.amazonaws.com": "AWS ELB", "azurewebsites.net": "Azure App Service",
+    "cloudapp.net": "Azure", "blob.core.windows.net": "Azure Blob",
+    "googleapis.com": "Google", "googlehosted.com": "Google",
+    "herokuapp.com": "Heroku", "herokudns.com": "Heroku",
+    "netlify.app": "Netlify", "vercel.app": "Vercel",
+    "pages.dev": "Cloudflare Pages", "workers.dev": "Cloudflare Workers",
+    "github.io": "GitHub Pages", "gitlab.io": "GitLab Pages",
+    "fastly.net": "Fastly", "akamai.net": "Akamai",
+    "azureedge.net": "Azure CDN", "myshopify.com": "Shopify",
 }
 
 DNS_RECORD_TYPES = ["A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "CAA"]
@@ -697,6 +704,10 @@ JS_ENDPOINT_RE = re.compile(
 )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# DNS
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def resolve_full(host: str) -> dict[str, list[str]]:
     out = {t: [] for t in DNS_RECORD_TYPES}
     if not HAS_DNS:
@@ -707,8 +718,8 @@ async def resolve_full(host: str) -> dict[str, list[str]]:
         return out
 
     resolver = dns.asyncresolver.Resolver()
-    resolver.lifetime = 3.0
-    resolver.timeout = 2.0
+    resolver.lifetime = CONFIG["timeouts"]["dns"]
+    resolver.timeout = CONFIG["timeouts"]["dns"]
 
     async def one(typ: str):
         try:
@@ -780,6 +791,10 @@ async def brute_subdomains(root: str, words: list[str], scope: Scope, store: Sto
     await asyncio.gather(*(one(w) for w in words))
     return found
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FINGERPRINTING
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_structural_html(body: str) -> str:
     parts = []
@@ -865,32 +880,20 @@ def cors_issue(origin: str, headers: dict[str, str]) -> Optional[dict]:
     acac = headers.get("access-control-allow-credentials", "").lower()
 
     if acao == "*" and acac == "true":
-        return {
-            "severity": "HIGH",
-            "confidence": 85,
-            "description": "Wildcard ACAO with ACAC=true; non-browser tooling can leverage the combination.",
-        }
+        return {"severity": "HIGH", "confidence": 85,
+                "description": "Wildcard ACAO with ACAC=true; non-browser tooling can leverage the combination."}
     if acao == origin and acac == "true":
-        return {
-            "severity": "HIGH",
-            "confidence": 95,
-            "description": f"Origin '{origin}' reflected in ACAO with ACAC=true; any origin can read authenticated responses.",
-        }
+        return {"severity": "HIGH", "confidence": 95,
+                "description": f"Origin '{origin}' reflected in ACAO with ACAC=true; any origin can read authenticated responses."}
     if acao == origin and acac != "true":
-        return {
-            "severity": "LOW",
-            "confidence": 40,
-            "description": f"Origin '{origin}' reflected in ACAO without ACAC=true; low risk, verify sensitive endpoints.",
-        }
+        return {"severity": "LOW", "confidence": 40,
+                "description": f"Origin '{origin}' reflected in ACAO without ACAC=true; low risk, verify sensitive endpoints."}
     return None
 
 
 def cache_policy_issue(url: str, headers: dict[str, str], status: Optional[int]) -> Optional[str]:
     path = urllib.parse.urlsplit(url).path.lower()
-    sensitive = any(x in path for x in [
-        "/account", "/profile", "/user", "/settings", "/billing",
-        "/admin", "/dashboard", "/session", "/token", "/oauth",
-    ])
+    sensitive = any(x in path for x in ["/account", "/profile", "/user", "/settings", "/billing", "/admin", "/dashboard", "/session", "/token", "/oauth"])
     if not sensitive or status != 200:
         return None
     cc = headers.get("cache-control", "").lower()
@@ -898,6 +901,10 @@ def cache_policy_issue(url: str, headers: dict[str, str], status: Optional[int])
         return "Sensitive-looking route has a public cache policy"
     return None
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CVE / CPE CORRELATION
+# ══════════════════════════════════════════════════════════════════════════════
 
 def init_cve_cache() -> sqlite3.Connection:
     CVE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -939,10 +946,7 @@ async def update_cve_cache(cpes: list[str], api_key: Optional[str] = None):
                 for vuln in data.get("vulnerabilities", []):
                     cve = vuln.get("cve", {})
                     cve_id = cve.get("id", "")
-                    desc = next(
-                        (d["value"] for d in cve.get("descriptions", []) if d.get("lang") == "en"),
-                        ""
-                    )
+                    desc = next((d["value"] for d in cve.get("descriptions", []) if d.get("lang") == "en"), "")
                     cvss = 0.0
                     for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
                         for metric in cve.get("metrics", {}).get(key, []):
@@ -955,8 +959,7 @@ async def update_cve_cache(cpes: list[str], api_key: Optional[str] = None):
                         """INSERT OR REPLACE INTO cve_lookup
                         (cpe, version, cve_id, cvss, severity, description, published, fetched)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (cpe, None, cve_id, cvss, severity, desc[:500],
-                         cve.get("published", ""), now_iso()),
+                        (cpe, None, cve_id, cvss, severity, desc[:500], cve.get("published", ""), now_iso()),
                     )
                     n += 1
                 conn.commit()
@@ -1004,6 +1007,10 @@ def correlate_cve(tech: dict, asset: str, engine: Engine):
             ))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CRAWLING
+# ══════════════════════════════════════════════════════════════════════════════
+
 def extract_links(base: str, body: str) -> set[str]:
     out: set[str] = set()
     for m in URL_RE.findall(body):
@@ -1021,13 +1028,7 @@ def extract_js_endpoints(base: str, body: str) -> set[str]:
     return out
 
 
-async def crawl(
-    start: str,
-    scope: Scope,
-    client: HTTPClient,
-    store: Store,
-    max_pages: int = 50,
-) -> tuple[set[str], set[str]]:
+async def crawl(start: str, scope: Scope, client: HTTPClient, store: Store, max_pages: int = 50) -> tuple[set[str], set[str]]:
     q = deque([norm_url(start)])
     seen: set[str] = set()
     links: set[str] = set()
@@ -1039,16 +1040,10 @@ async def crawl(
             continue
         seen.add(url)
         r = await client.get(url)
-        if not r["ok"]:
-            continue
-        if r.get("redirect_out_of_scope"):
+        if not r["ok"] or r.get("redirect_out_of_scope"):
             continue
 
-        store.observation(url, "http", {
-            "status": r["status"],
-            "headers": r["headers"],
-            "elapsed": r["elapsed"],
-        })
+        store.observation(url, "http", {"status": r["status"], "headers": r["headers"], "elapsed": r["elapsed"]})
 
         for u in extract_links(url, r["body"]):
             if scope.url_allowed(u):
@@ -1071,6 +1066,10 @@ async def crawl(
 
     return links, endpoints
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPENAPI INSPECTION
+# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_openapi(text: str) -> dict[str, Any]:
     try:
@@ -1101,26 +1100,20 @@ def inspect_openapi(doc: dict[str, Any]) -> list[dict[str, Any]]:
             operation = operation if isinstance(operation, dict) else {}
             security = operation.get("security", doc.get("security"))
             if not security:
-                findings.append({
-                    "type": "documented-no-security",
-                    "method": method.upper(),
-                    "path": path,
-                })
+                findings.append({"type": "documented-no-security", "method": method.upper(), "path": path})
             text = json.dumps(operation, ensure_ascii=False).lower()
             if any(x in text for x in ["password", "token", "secret", "api_key"]):
-                findings.append({
-                    "type": "sensitive-field-in-schema",
-                    "method": method.upper(),
-                    "path": path,
-                })
+                findings.append({"type": "sensitive-field-in-schema", "method": method.upper(), "path": path})
     return findings
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SAFE PARAMETER PROBES
+# ══════════════════════════════════════════════════════════════════════════════
+
 def parse_query_params(url: str) -> list[str]:
     try:
-        return sorted({k for k, _ in urllib.parse.parse_qsl(
-            urllib.parse.urlsplit(url).query, keep_blank_values=True
-        )})
+        return sorted({k for k, _ in urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=True)})
     except Exception:
         return []
 
@@ -1154,6 +1147,10 @@ async def safe_xss_probe(url: str, param: str, client: HTTPClient) -> Optional[F
     if not r["ok"] or canary not in r["body"]:
         return None
 
+    ct = r["headers"].get("content-type", "").lower()
+    if "html" not in ct:
+        return None
+
     return Finding(
         title="Reflected input",
         severity="LOW",
@@ -1161,13 +1158,11 @@ async def safe_xss_probe(url: str, param: str, client: HTTPClient) -> Optional[F
         category="reflection",
         asset=url,
         location=param,
-        description="Inert canary reflected in the response; context-sensitive validation required.",
+        description="Inert canary reflected in HTML response; context-sensitive validation required.",
         remediation="Apply context-aware output encoding and validate input handling.",
         evidence=Evidence(
-            request=probe,
-            status=r["status"],
-            headers={k: v for k, v in r["headers"].items()
-                     if k.lower() in {"content-type", "content-security-policy"}},
+            request=probe, status=r["status"],
+            headers={k: v for k, v in r["headers"].items() if k.lower() in {"content-type", "content-security-policy"}},
             snippet=short_body(r["body"].replace(canary, "[FOX_CANARY]")),
             elapsed=r["elapsed"],
         ),
@@ -1194,16 +1189,11 @@ async def safe_sql_probe(url: str, param: str, client: HTTPClient) -> Optional[F
         if not r["ok"]:
             continue
         body = r["body"]
-        error_markers = ["sql syntax", "mysql", "postgresql", "pg_query", "ora-",
-                         "sqlite error", "microsoft sql server", "odbc"]
+        error_markers = ["sql syntax", "mysql", "postgresql", "pg_query", "ora-", "sqlite error", "microsoft sql server", "odbc"]
         if any(m in body.lower() for m in error_markers):
             return Finding(
-                title="Potential SQL error disclosure",
-                severity="MED",
-                confidence=75,
-                category="sql-error",
-                asset=url,
-                location=param,
+                title="Potential SQL error disclosure", severity="MED", confidence=75,
+                category="sql-error", asset=url, location=param,
                 description="A syntax probe triggered a database-related error signature; detection only.",
                 remediation="Use parameterized queries and avoid exposing database errors to clients.",
                 evidence=Evidence(request=u, status=r["status"], snippet=short_body(body), elapsed=r["elapsed"]),
@@ -1214,12 +1204,8 @@ async def safe_sql_probe(url: str, param: str, client: HTTPClient) -> Optional[F
         len_changed = abs(len(body) - base_len) > max(500, int(base_len * 0.8))
         if status_changed and ct_changed and len_changed:
             return Finding(
-                title="Parameter response anomaly",
-                severity="LOW",
-                confidence=25,
-                category="input-anomaly",
-                asset=url,
-                location=param,
+                title="Parameter response anomaly", severity="LOW", confidence=25,
+                category="input-anomaly", asset=url, location=param,
                 description="Multiple signals diverge from baseline; manual review recommended.",
                 remediation="Inspect server-side parameter parsing behavior.",
                 evidence=Evidence(request=u, status=r["status"], snippet=short_body(body), elapsed=r["elapsed"]),
@@ -1227,38 +1213,23 @@ async def safe_sql_probe(url: str, param: str, client: HTTPClient) -> Optional[F
     return None
 
 
-def make_bb_finding(
-    title: str,
-    severity: str,
-    confidence: int,
-    category: str,
-    asset: str,
-    description: str,
-    remediation: str,
-    request: str = "",
-    response: Optional[dict[str, Any]] = None,
-    location: str = "",
-) -> Finding:
+# ══════════════════════════════════════════════════════════════════════════════
+# BUG BOUNTY EXTENSION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_bb_finding(title: str, severity: str, confidence: int, category: str, asset: str,
+                    description: str, remediation: str, request: str = "",
+                    response: Optional[dict[str, Any]] = None, location: str = "") -> Finding:
     response = response or {}
     return Finding(
-        title=title,
-        severity=severity,
-        confidence=confidence,
-        category=category,
-        asset=asset,
-        location=location,
-        description=description,
-        remediation=remediation,
+        title=title, severity=severity, confidence=confidence, category=category,
+        asset=asset, location=location, description=description, remediation=remediation,
         evidence=Evidence(
-            request=request,
-            status=response.get("status"),
+            request=request, status=response.get("status"),
             headers={k: v for k, v in response.get("headers", {}).items()
-                     if k.lower() in {"content-type", "location", "server",
-                                      "content-security-policy",
-                                      "access-control-allow-origin",
-                                      "access-control-allow-credentials"}},
-            snippet=short_body(response.get("body", "")),
-            elapsed=response.get("elapsed", 0.0),
+                     if k.lower() in {"content-type", "location", "server", "content-security-policy",
+                                      "access-control-allow-origin", "access-control-allow-credentials"}},
+            snippet=short_body(response.get("body", "")), elapsed=response.get("elapsed", 0.0),
         ),
     )
 
@@ -1273,22 +1244,16 @@ def classify_reflection_context(body: str, canary: str) -> dict:
     window = (before + after).lower()
 
     if "<script" in window and ">" not in before[-10:]:
-        return {"context": "script_tag", "confidence": 85,
-                "note": "Canary appears inside a script block"}
+        return {"context": "script_tag", "confidence": 85, "note": "Canary appears inside a script block"}
     if re.search(r'<[a-z][^>]*=\s*["\'][^"\']*$', before, re.I):
-        return {"context": "attribute_quoted", "confidence": 65,
-                "note": "Canary appears inside a quoted attribute value"}
+        return {"context": "attribute_quoted", "confidence": 65, "note": "Canary appears inside a quoted attribute value"}
     if re.search(r'<[a-z][^>]*=\s*[^"\'\s>]*$', before, re.I):
-        return {"context": "attribute_unquoted", "confidence": 75,
-                "note": "Canary appears inside an unquoted attribute value"}
+        return {"context": "attribute_unquoted", "confidence": 75, "note": "Canary appears inside an unquoted attribute value"}
     if re.search(r'<[^>]+$', before):
-        return {"context": "html_tag", "confidence": 40,
-                "note": "Canary appears inside an HTML tag"}
+        return {"context": "html_tag", "confidence": 40, "note": "Canary appears inside an HTML tag"}
     if "javascript:" in window or "onerror=" in window or "onload=" in window:
-        return {"context": "js_uri", "confidence": 70,
-                "note": "Canary appears near a JS URI or event handler"}
-    return {"context": "html_body", "confidence": 30,
-            "note": "Canary reflected in HTML body context"}
+        return {"context": "js_uri", "confidence": 70, "note": "Canary appears near a JS URI or event handler"}
+    return {"context": "html_body", "confidence": 30, "note": "Canary reflected in HTML body context"}
 
 
 async def bb_probe_reflection(url: str, param: str, client: HTTPClient, engine: Engine):
@@ -1298,19 +1263,16 @@ async def bb_probe_reflection(url: str, param: str, client: HTTPClient, engine: 
     if not r["ok"] or canary not in r.get("body", ""):
         return
 
+    ct = r["headers"].get("content-type", "").lower()
+    if "html" not in ct:
+        return
+
     ctx = classify_reflection_context(r["body"], canary)
-    sev = {
-        "script_tag": "HIGH",
-        "attribute_unquoted": "MED",
-        "attribute_quoted": "LOW",
-        "js_uri": "MED",
-        "html_tag": "LOW",
-        "html_body": "LOW",
-    }.get(ctx["context"], "LOW")
+    sev = {"script_tag": "HIGH", "attribute_unquoted": "MED", "attribute_quoted": "LOW",
+           "js_uri": "MED", "html_tag": "LOW", "html_body": "LOW"}.get(ctx["context"], "LOW")
 
     engine.add(make_bb_finding(
-        f"Reflected canary ({ctx['context']})",
-        sev, ctx["confidence"], "reflection", url,
+        f"Reflected canary ({ctx['context']})", sev, ctx["confidence"], "reflection", url,
         f"{ctx['note']}. Inert canary; manual context validation required.",
         "Apply context-aware output encoding for the specific insertion point.",
         probe, r, param,
@@ -1334,11 +1296,7 @@ async def bb_probe_open_redirect(url: str, param: str, client: HTTPClient, engin
 
 
 async def bb_probe_ssti(url: str, param: str, client: HTTPClient, engine: Engine):
-    probes = [
-        "{{FOXBB_SSTI_91B2E7}}",
-        "${FOXBB_SSTI_91B2E7}",
-        "<%=FOXBB_SSTI_91B2E7%>",
-    ]
+    probes = ["{{FOXBB_SSTI_91B2E7}}", "${FOXBB_SSTI_91B2E7}", "<%=FOXBB_SSTI_91B2E7%>"]
     for payload in probes:
         probe = replace_query_param(url, param, payload)
         r = await client.get(probe)
@@ -1367,8 +1325,7 @@ async def bb_probe_error_disclosure(url: str, param: str, client: HTTPClient, en
             if hit:
                 sev = "MED" if group in {"stack_trace", "debug"} else "LOW"
                 engine.add(make_bb_finding(
-                    f"Potential {group.replace('_', ' ')} disclosure",
-                    sev, 80, "error-disclosure", url,
+                    f"Potential {group.replace('_', ' ')} disclosure", sev, 80, "error-disclosure", url,
                     f"A malformed-input probe exposed a response marker: {hit}",
                     "Return generic client errors and keep diagnostic details server-side.",
                     probe, r, param,
@@ -1393,56 +1350,17 @@ def discover_parameters_from_html(base: str, body: str) -> set[str]:
     return params
 
 
-def analyze_security_txt(body: str) -> dict[str, Any]:
-    fields: dict[str, list[str]] = {}
-    for line in body.splitlines():
-        if ":" in line and not line.lstrip().startswith("#"):
-            k, v = line.split(":", 1)
-            fields.setdefault(k.strip().lower(), []).append(v.strip())
-    return {
-        "contacts": fields.get("contact", []),
-        "policy": fields.get("policy", []),
-        "expires": fields.get("expires", []),
-        "canonical": fields.get("canonical", []),
-    }
-
-
-def analyze_jwt(token: str) -> dict:
-    parts = token.split(".")
-    if len(parts) != 3:
-        return {"valid_structure": False}
-    try:
-        header = json.loads(base64.urlsafe_b64decode(parts[0] + "=="))
-        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=="))
-    except Exception:
-        return {"valid_structure": False}
-
-    observations: list[dict] = []
-    if header.get("alg") == "none":
-        observations.append({
-            "severity": "HIGH",
-            "confidence": 90,
-            "note": "alg=none: unsigned token. Verify server acceptance of unsigned JWTs.",
-        })
-    if str(header.get("alg", "")).startswith("HS") and "kid" in header:
-        observations.append({
-            "severity": "INFO",
-            "confidence": 30,
-            "note": "HS* with kid header: potential key confusion if kid is attacker-controllable.",
-        })
-    if "exp" not in payload:
-        observations.append({
-            "severity": "LOW",
-            "confidence": 25,
-            "note": "No exp claim. Impact depends on token purpose (access vs refresh).",
-        })
-
-    return {
-        "valid_structure": True,
-        "algorithm": header.get("alg"),
-        "claims": list(payload.keys()),
-        "observations": observations,
-    }
+def bb_parameter_priority(params: set[str]) -> list[str]:
+    def score(p: str) -> int:
+        low = p.lower()
+        if low in INTERESTING_PARAMS:
+            return 100
+        if any(x in low for x in INTERESTING_PARAMS):
+            return 70
+        if re.search(r"(id|url|path|token|key|query|search|redirect)", low):
+            return 50
+        return 10
+    return sorted(params, key=lambda p: (-score(p), p.lower()))
 
 
 async def bb_exposure_sweep(base: str, scope: Scope, client: HTTPClient, engine: Engine):
@@ -1455,46 +1373,30 @@ async def bb_exposure_sweep(base: str, scope: Scope, client: HTTPClient, engine:
             continue
 
         body = r.get("body", "")
+        ct = r["headers"].get("content-type", "").lower()
         suspicious = False
 
         if path == "/.git/HEAD":
             suspicious = body.startswith("ref: refs/")
         elif path.startswith("/.env"):
-            suspicious = bool(re.search(
-                r"(?m)^(?:APP_KEY|DB_|AWS_|SECRET|PASSWORD|TOKEN)[A-Z0-9_]*\s*=",
-                body,
-            ))
+            suspicious = bool(re.search(r"(?m)^(?:APP_KEY|DB_|AWS_|SECRET|PASSWORD|TOKEN)[A-Z0-9_]*\s*=", body))
         elif path == "/package.json":
             suspicious = body.lstrip().startswith("{") and '"dependencies"' in body
         elif path in {"/composer.json", "/package-lock.json", "/yarn.lock"}:
-            suspicious = len(body) > 20
+            suspicious = len(body) > 20 and ("html" not in ct)
         elif path in {"/phpinfo.php", "/server-status", "/server-info"}:
-            suspicious = len(body) > 100
+            suspicious = len(body) > 100 and ("html" in ct)
         else:
-            suspicious = len(body) > 20
+            suspicious = len(body) > 20 and ("html" not in ct)
 
         if suspicious:
             severity = "HIGH" if path.startswith("/.env") or path == "/.git/HEAD" else "MED"
             engine.add(make_bb_finding(
-                f"Potentially exposed {label}",
-                severity, 95, "exposure", base,
+                f"Potentially exposed {label}", severity, 95, "exposure", base,
                 f"{path} returned HTTP {r['status']} with content consistent with {label}.",
                 "Remove the exposed resource or restrict it to authorized administrative access.",
                 u, r, path,
             ))
-
-
-def bb_parameter_priority(params: set[str]) -> list[str]:
-    def score(p: str) -> int:
-        low = p.lower()
-        if low in INTERESTING_PARAMS:
-            return 100
-        if any(x in low for x in INTERESTING_PARAMS):
-            return 70
-        if re.search(r"(id|url|path|token|key|query|search|redirect)", low):
-            return 50
-        return 10
-    return sorted(params, key=lambda p: (-score(p), p.lower()))
 
 
 async def bb_bug_bounty_web(args, scope: Scope, client: HTTPClient, store: Store, engine: Engine):
@@ -1552,7 +1454,7 @@ async def bb_bug_bounty_web(args, scope: Scope, client: HTTPClient, store: Store
             if rr["ok"]:
                 ct = rr["headers"].get("content-type", "")
                 store.observation(u, "graphql", {"status": rr["status"], "content_type": ct})
-                if rr["status"] in {200, 400, 405}:
+                if rr["status"] in {200, 400, 405} and "json" in ct:
                     engine.add(make_bb_finding(
                         "GraphQL endpoint discovered", "INFO", 95, "graphql", u,
                         "A GraphQL-like endpoint was discovered during crawling.",
@@ -1560,6 +1462,20 @@ async def bb_bug_bounty_web(args, scope: Scope, client: HTTPClient, store: Store
                         u, rr,
                     ))
 
+
+def analyze_security_txt(body: str) -> dict[str, Any]:
+    fields: dict[str, list[str]] = {}
+    for line in body.splitlines():
+        if ":" in line and not line.lstrip().startswith("#"):
+            k, v = line.split(":", 1)
+            fields.setdefault(k.strip().lower(), []).append(v.strip())
+    return {"contacts": fields.get("contact", []), "policy": fields.get("policy", []),
+            "expires": fields.get("expires", []), "canonical": fields.get("canonical", [])}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATIC ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def scan_secrets(path: Path) -> list[Finding]:
     out: list[Finding] = []
@@ -1579,12 +1495,8 @@ def scan_secrets(path: Path) -> list[Finding]:
             if m:
                 line = text.count("\n", 0, m.start()) + 1
                 out.append(Finding(
-                    title=f"Potential secret: {name}",
-                    severity="HIGH",
-                    confidence=70,
-                    category="secret",
-                    asset=str(file),
-                    location=f"line {line}",
+                    title=f"Potential secret: {name}", severity="HIGH", confidence=70,
+                    category="secret", asset=str(file), location=f"line {line}",
                     description="Potential credential matched a secret heuristic; value not printed.",
                     remediation="Rotate exposed credentials, remove from source control, use a secret manager.",
                 ))
@@ -1609,17 +1521,17 @@ def scan_python_taint(path: Path) -> list[Finding]:
             for sink, label in TAINT_SINKS:
                 if sink in line and any(re.search(rf"\b{re.escape(v)}\b", line) for v in tainted):
                     out.append(Finding(
-                        title=f"Potential taint flow: {label}",
-                        severity="HIGH",
-                        confidence=60,
-                        category="taint",
-                        asset=str(file),
-                        location=f"line {idx}",
+                        title=f"Potential taint flow: {label}", severity="HIGH", confidence=60,
+                        category="taint", asset=str(file), location=f"line {idx}",
                         description=f"Possible user-controlled data reaching {sink}; static heuristic.",
                         remediation="Validate, constrain and encode untrusted data before security-sensitive sinks.",
                     ))
     return out
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TLS / PORTS
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def tls_info(host: str, port: int = 443) -> dict[str, Any]:
     def work():
@@ -1627,13 +1539,9 @@ async def tls_info(host: str, port: int = 443) -> dict[str, Any]:
         with socket.create_connection((host, port), timeout=5) as raw:
             with ctx.wrap_socket(raw, server_hostname=host) as s:
                 cert = s.getpeercert()
-                return {
-                    "tls_version": s.version(),
-                    "cipher": s.cipher()[0] if s.cipher() else None,
-                    "subject": str(cert.get("subject")),
-                    "issuer": str(cert.get("issuer")),
-                    "notAfter": cert.get("notAfter"),
-                }
+                return {"tls_version": s.version(), "cipher": s.cipher()[0] if s.cipher() else None,
+                        "subject": str(cert.get("subject")), "issuer": str(cert.get("issuer")),
+                        "notAfter": cert.get("notAfter")}
     try:
         return await asyncio.to_thread(work)
     except Exception as exc:
@@ -1693,15 +1601,13 @@ def identify_service(banner: str, port: int) -> str:
     return PORT_SERVICES.get(port, "unknown")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# REPORTERS
+# ══════════════════════════════════════════════════════════════════════════════
+
 def export_json(engine: Engine, path: str, target: str):
-    payload = {
-        "tool": "fox",
-        "version": VERSION,
-        "target": target,
-        "generated": now_iso(),
-        "summary": engine.counts(),
-        "findings": [f.to_dict() for f in engine.findings.values()],
-    }
+    payload = {"tool": "fox", "version": VERSION, "target": target, "generated": now_iso(),
+               "summary": engine.counts(), "findings": [f.to_dict() for f in engine.findings.values()]}
     Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -1711,94 +1617,120 @@ def export_sarif(engine: Engine, path: str, target: str):
     for f in engine.findings.values():
         if f.category not in rules:
             rules[f.category] = {
-                "id": f.category,
-                "name": f.category.replace("-", " ").title(),
+                "id": f.category, "name": f.category.replace("-", " ").title(),
                 "shortDescription": {"text": f.category},
                 "help": {"text": f.remediation or "Review the finding and apply appropriate mitigation."},
                 "properties": {"tags": ["security", "fox"]},
             }
         results.append({
-            "ruleId": f.category,
-            "ruleIndex": list(rules.keys()).index(f.category),
+            "ruleId": f.category, "ruleIndex": list(rules.keys()).index(f.category),
             "level": "error" if severity_rank(f.severity) >= 4 else "warning",
             "message": {"text": f.description or f.title},
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": f.asset},
-                    "region": {"snippet": {"text": f.location[:200]}},
-                }
-            }],
+            "locations": [{"physicalLocation": {"artifactLocation": {"uri": f.asset},
+                                              "region": {"snippet": {"text": f.location[:200]}}}}],
             "fingerprints": {"fox/v1": f.fingerprint},
-            "properties": {
-                "severity": f.severity,
-                "confidence": f.confidence,
-                "risk_score": risk_score(f),
-                "evidence_status": f.evidence.status,
-            },
+            "properties": {"severity": f.severity, "confidence": f.confidence, "risk_score": risk_score(f)},
         })
-    payload = {
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {"driver": {"name": "fox", "version": VERSION, "rules": list(rules.values())}},
-            "results": results,
-            "invocations": [{"executionSuccessful": True, "endTimeUtc": now_iso()}],
-        }],
-    }
+    payload = {"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
+               "runs": [{"tool": {"driver": {"name": "fox", "version": VERSION, "rules": list(rules.values())}},
+                         "results": results, "invocations": [{"executionSuccessful": True, "endTimeUtc": now_iso()}]}]}
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def export_html(engine: Engine, path: str, target: str):
     counts = engine.counts()
     rows: list[str] = []
-    for f in sorted(engine.findings.values(),
-                    key=lambda x: (-severity_rank(x.severity), -risk_score(x), x.category)):
-        rs = risk_score(f)
+    for f in sorted(engine.findings.values(), key=lambda x: (-severity_rank(x.severity), -risk_score(x), x.category)):
         rows.append(
-            f"<tr class='{f.severity}'>"
-            f"<td>{f.severity}</td>"
-            f"<td>{f.confidence}%</td>"
-            f"<td>{rs:.1f}</td>"
-            f"<td>{html_lib.escape(f.category)}</td>"
-            f"<td>{html_lib.escape(f.title)}</td>"
-            f"<td>{html_lib.escape(f.asset)}</td>"
-            f"<td>{html_lib.escape(f.location)}</td>"
-            "</tr>"
+            f"<tr class='{f.severity}'><td>{f.severity}</td><td>{f.confidence}%</td><td>{risk_score(f):.1f}</td>"
+            f"<td>{html_lib.escape(f.category)}</td><td>{html_lib.escape(f.title)}</td>"
+            f"<td>{html_lib.escape(f.asset)}</td><td>{html_lib.escape(f.location)}</td></tr>"
         )
-    doc = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>fox — {html_lib.escape(target)}</title>
-<style>
-body{{font-family:system-ui;background:#0b0d10;color:#e8e8e8;margin:0;padding:30px}}
-h1{{margin:0 0 4px}}small{{color:#888}}
-.summary{{display:flex;gap:16px;margin:24px 0;flex-wrap:wrap}}
+    doc = f"""<!doctype html><html><head><meta charset="utf-8"><title>fox — {html_lib.escape(target)}</title>
+<style>body{{font-family:system-ui;background:#0b0d10;color:#e8e8e8;margin:0;padding:30px}}
+h1{{margin:0 0 4px}}small{{color:#888}}.summary{{display:flex;gap:16px;margin:24px 0;flex-wrap:wrap}}
 .badge{{padding:10px 16px;background:#15181c;border-radius:6px;border:1px solid #2a2d33;min-width:80px}}
-.badge b{{display:block;font-size:22px;margin-bottom:4px}}
-.CRIT{{color:#ff6b6b}}.HIGH{{color:#ffb070}}.MED{{color:#ffe070}}.LOW{{color:#88c4ff}}.INFO{{color:#888}}
-table{{width:100%;border-collapse:collapse;margin-top:24px}}
+.badge b{{display:block;font-size:22px;margin-bottom:4px}}.CRIT{{color:#ff6b6b}}.HIGH{{color:#ffb070}}
+.MED{{color:#ffe070}}.LOW{{color:#88c4ff}}.INFO{{color:#888}}table{{width:100%;border-collapse:collapse;margin-top:24px}}
 th,td{{border:1px solid #2a2d33;padding:9px;vertical-align:top;text-align:left;font-size:13px}}
-th{{background:#171a1f;font-weight:600}}
-tr.CRIT td:first-child{{color:#ff6b6b;font-weight:bold}}
-tr.HIGH td:first-child{{color:#ffb070;font-weight:bold}}
-tr.MED td:first-child{{color:#ffe070}}
-</style></head>
-<body>
-<h1>fox {VERSION}</h1>
-<small>Target: {html_lib.escape(target)} · Generated: {now_iso()}</small>
-<div class="summary">
-<div class="badge"><b>{len(engine.findings)}</b>total</div>
+th{{background:#171a1f;font-weight:600}}tr.CRIT td:first-child{{color:#ff6b6b;font-weight:bold}}
+tr.HIGH td:first-child{{color:#ffb070;font-weight:bold}}tr.MED td:first-child{{color:#ffe070}}</style></head>
+<body><h1>fox {VERSION}</h1><small>Target: {html_lib.escape(target)} · Generated: {now_iso()}</small>
+<div class="summary"><div class="badge"><b>{len(engine.findings)}</b>total</div>
 <div class="badge"><b class="CRIT">{counts.get("CRIT",0)}</b>critical</div>
 <div class="badge"><b class="HIGH">{counts.get("HIGH",0)}</b>high</div>
 <div class="badge"><b class="MED">{counts.get("MED",0)}</b>medium</div>
 <div class="badge"><b class="LOW">{counts.get("LOW",0)}</b>low</div>
-<div class="badge"><b class="INFO">{counts.get("INFO",0)}</b>info</div>
-</div>
-<table>
-<tr><th>Severity</th><th>Confidence</th><th>Risk</th><th>Category</th><th>Title</th><th>Asset</th><th>Location</th></tr>
-{''.join(rows)}
-</table>
-</body></html>"""
+<div class="badge"><b class="INFO">{counts.get("INFO",0)}</b>info</div></div>
+<table><tr><th>Severity</th><th>Confidence</th><th>Risk</th><th>Category</th><th>Title</th><th>Asset</th><th>Location</th></tr>
+{''.join(rows)}</table></body></html>"""
     Path(path).write_text(doc, encoding="utf-8")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERACTIVE MODE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def interactive_mode():
+    if not HAS_QUESTIONARY:
+        print(f"{RED}questionary required for interactive mode.{RESET}")
+        print(f"Install: python3 -m pip install questionary")
+        sys.exit(1)
+
+    console.print(Panel.fit("[bold cyan]fox[/bold cyan] — interactive detection & recon", border_style="cyan"))
+
+    target = questionary.text("Target (domain/host/URL):", default="").ask()
+    if not target:
+        console.print("[red]Target required.[/red]")
+        sys.exit(1)
+
+    mode = questionary.select(
+        "Mode:",
+        choices=[
+            "web — HTTP fingerprint, headers, endpoints",
+            "subdomains — passive + optional DNS brute",
+            "ports — TCP scan + banners + TLS",
+            "static — local source analysis",
+            "full — subdomains + ports + web",
+        ],
+    ).ask()
+    mode_key = mode.split(" — ")[0]
+
+    advanced = questionary.confirm("Configure advanced options?", default=False).ask()
+
+    kwargs = {"target": target, "mode": mode_key, "no_subdomains": False, "brute": False,
+              "crawl": False, "active": False, "bb": False, "semgrep": False,
+              "insecure": False, "path": ".", "db": "fox.db", "output": "fox_report",
+              "concurrency": 20, "port_concurrency": 100, "rps": 5.0, "timeout": 10.0,
+              "retries": 2, "max_body": 500_000, "max_pages": 50, "max_params": 10,
+              "max_endpoints": 100, "max_active_probes": 100,
+              "ports": "80,443,8000,8008,8080,8081,8443,8888,3000,5000",
+              "exclude": [], "exclude_path": [], "cidr": [], "cve_api_key": None}
+
+    if advanced:
+        if mode_key in {"web", "full"}:
+            kwargs["crawl"] = questionary.confirm("Crawl links and JS endpoints?", default=True).ask()
+            kwargs["bb"] = questionary.confirm("Enable bug-bounty modules (exposure sweep, GraphQL)?", default=False).ask()
+            if kwargs["bb"]:
+                kwargs["active"] = questionary.confirm("Enable active probes (reflection/SSTI/redirect/error)?", default=False).ask()
+        if mode_key in {"subdomains", "full"}:
+            kwargs["brute"] = questionary.confirm("DNS brute-force subdomains?", default=False).ask()
+            kwargs["no_subdomains"] = questionary.confirm("Block subdomains outside root?", default=False).ask()
+        if mode_key in {"static"}:
+            kwargs["path"] = questionary.path("Source directory:", default=".").ask()
+            kwargs["semgrep"] = questionary.confirm("Use Semgrep if installed?", default=False).ask()
+        if mode_key in {"web", "full", "ports"}:
+            kwargs["insecure"] = questionary.confirm("Disable TLS verification (internal test only)?", default=False).ask()
+        if mode_key in {"web", "full"}:
+            kwargs["rps"] = float(questionary.text("Requests per second:", default="5").ask() or 5)
+            kwargs["concurrency"] = int(questionary.text("Concurrency:", default="20").ask() or 20)
+
+    return kwargs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODES
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def mode_subdomains(args, scope, client, store, engine):
     root = next(iter(scope.roots))
@@ -1809,12 +1741,10 @@ async def mode_subdomains(args, scope, client, store, engine):
     results |= await hackertarget_subdomains(root, client, scope, store)
 
     if args.brute:
-        words = [
-            "www", "api", "app", "dev", "test", "staging", "stage", "admin", "portal",
-            "mail", "vpn", "auth", "login", "cdn", "static", "assets", "docs", "status",
-            "monitor", "grafana", "git", "gitlab", "jenkins", "ci", "registry", "sso",
-            "shop", "store", "blog", "support", "help", "m", "mobile", "beta", "demo",
-        ]
+        words = ["www", "api", "app", "dev", "test", "staging", "stage", "admin", "portal",
+                 "mail", "vpn", "auth", "login", "cdn", "static", "assets", "docs", "status",
+                 "monitor", "grafana", "git", "gitlab", "jenkins", "ci", "registry", "sso",
+                 "shop", "store", "blog", "support", "help", "m", "mobile", "beta", "demo"]
         print(f"{CYAN}[*]{RESET} DNS brute: {len(words)} candidates")
         results |= await brute_subdomains(root, words, scope, store)
 
@@ -1828,12 +1758,8 @@ async def mode_subdomains(args, scope, client, store, engine):
         store.asset("subdomain_full", host, "resolver")
         if cloud:
             engine.add(Finding(
-                title=f"Cloud CNAME to {cloud}",
-                severity="INFO",
-                confidence=90,
-                category="cloud-cname",
-                asset=host,
-                location=cname,
+                title=f"Cloud CNAME to {cloud}", severity="INFO", confidence=90,
+                category="cloud-cname", asset=host, location=cname,
                 description=f"CNAME points to {cloud} ({cname})",
                 remediation="Verify that the cloud resource is still owned by the organization.",
             ))
@@ -1874,23 +1800,16 @@ async def mode_web(args, scope, client, store, engine):
         if key not in low_headers:
             sev = "MED" if key in {"strict-transport-security", "content-security-policy"} else "LOW"
             engine.add(Finding(
-                title=f"Missing {label}",
-                severity=sev,
-                confidence=95,
-                category="security-header",
-                asset=target,
+                title=f"Missing {label}", severity=sev, confidence=95,
+                category="security-header", asset=target,
                 description=f"{label} not present in the HTTP response.",
                 remediation=f"Configure {label} according to the application's security requirements.",
             ))
 
     for name, missing in cookie_flags(headers):
         engine.add(Finding(
-            title=f"Cookie flags missing: {name}",
-            severity="MED",
-            confidence=90,
-            category="cookie",
-            asset=target,
-            location=name,
+            title=f"Cookie flags missing: {name}", severity="MED", confidence=90,
+            category="cookie", asset=target, location=name,
             description=f"Missing flags: {missing}",
             remediation="Set Secure, HttpOnly and an appropriate SameSite policy.",
         ))
@@ -1898,11 +1817,8 @@ async def mode_web(args, scope, client, store, engine):
     cors = cors_issue(target, headers)
     if cors:
         engine.add(Finding(
-            title="Potentially unsafe CORS policy",
-            severity=cors["severity"],
-            confidence=cors["confidence"],
-            category="cors",
-            asset=target,
+            title="Potentially unsafe CORS policy", severity=cors["severity"],
+            confidence=cors["confidence"], category="cors", asset=target,
             description=cors["description"],
             remediation="Use an explicit trusted-origin allowlist and avoid credentialed wildcard CORS.",
         ))
@@ -1910,12 +1826,8 @@ async def mode_web(args, scope, client, store, engine):
     cache_issue = cache_policy_issue(target, headers, r["status"])
     if cache_issue:
         engine.add(Finding(
-            title="Potentially cacheable sensitive response",
-            severity="MED",
-            confidence=75,
-            category="cache-policy",
-            asset=target,
-            description=cache_issue,
+            title="Potentially cacheable sensitive response", severity="MED", confidence=75,
+            category="cache-policy", asset=target, description=cache_issue,
             remediation="Use appropriate private/no-store caching directives for sensitive responses.",
         ))
 
@@ -1925,25 +1837,58 @@ async def mode_web(args, scope, client, store, engine):
         for ep in sorted(endpoints)[:100]:
             print(f"  {DIM}{ep}{RESET}")
 
+    # Baseline SPA detection for endpoint verification
+    baseline_hash = simhash(short_body(body, 2000))
+    baseline_len = len(body)
+
+    expected_ct = {
+        "/openapi.json": ("json",), "/swagger.json": ("json",), "/swagger/v1/swagger.json": ("json",),
+        "/v3/api-docs": ("json",), "/api-docs": ("json", "yaml", "text"),
+        "/actuator": ("json", "text"), "/actuator/health": ("json", "text"),
+        "/metrics": ("text", "plain"), "/graphql": ("json", "text"),
+    }
+
     for path in SENSITIVE_PATHS:
         u = urllib.parse.urljoin(target, path)
         if not scope.url_allowed(u):
             continue
         rr = await client.get(u)
-        if rr["ok"] and rr["status"] in {200, 204, 401, 403}:
-            sev = "INFO"
-            if path in {"/actuator", "/debug", "/metrics", "/env"} and rr["status"] == 200:
-                sev = "MED"
+        if not rr["ok"] or rr["status"] not in {200, 204, 401, 403}:
+            continue
+
+        rbody = rr.get("body", "")
+        rct = rr["headers"].get("content-type", "").lower()
+
+        if rr["status"] in {401, 403}:
             engine.add(Finding(
-                title=f"Interesting endpoint: {path}",
-                severity=sev,
-                confidence=85,
-                category="endpoint",
-                asset=target,
-                location=path,
-                description=f"Endpoint responded with HTTP {rr['status']}; review exposure and authorization.",
-                evidence=Evidence(request=u, status=rr["status"], snippet=short_body(rr["body"]), elapsed=rr["elapsed"]),
+                title=f"Protected endpoint: {path}", severity="INFO", confidence=70,
+                category="endpoint", asset=target, location=path,
+                description=f"Endpoint responded with HTTP {rr['status']} (exists but protected).",
+                evidence=Evidence(request=u, status=rr["status"], snippet=short_body(rbody), elapsed=rr["elapsed"]),
             ))
+            continue
+
+        if rr["status"] == 204:
+            continue
+
+        if hamming_distance(baseline_hash, simhash(short_body(rbody, 2000))) <= 3:
+            continue
+        if baseline_len and abs(len(rbody) - baseline_len) < max(50, int(baseline_len * 0.05)):
+            continue
+
+        wants = expected_ct.get(path)
+        if wants and not any(w in rct for w in wants):
+            continue
+
+        sev = "INFO"
+        if path in {"/actuator", "/debug", "/metrics", "/env"} and rr["status"] == 200:
+            sev = "MED"
+        engine.add(Finding(
+            title=f"Interesting endpoint: {path}", severity=sev, confidence=85,
+            category="endpoint", asset=target, location=path,
+            description=f"Endpoint responded with HTTP {rr['status']} and content-type {rct or 'unknown'}; review exposure and authorization.",
+            evidence=Evidence(request=u, status=rr["status"], snippet=short_body(rbody), elapsed=rr["elapsed"]),
+        ))
 
     for path in ["/openapi.json", "/swagger.json", "/v3/api-docs"]:
         u = urllib.parse.urljoin(target, path)
@@ -1955,12 +1900,8 @@ async def mode_web(args, scope, client, store, engine):
                 print(f"{GREEN}[+]{RESET} OpenAPI {path}: {len(doc.get('paths', {}))} paths")
                 for item in items[:100]:
                     engine.add(Finding(
-                        title=f"OpenAPI review: {item['type']}",
-                        severity="INFO",
-                        confidence=30,
-                        category="openapi",
-                        asset=target,
-                        location=f"{item['method']} {item['path']}",
+                        title=f"OpenAPI review: {item['type']}", severity="INFO", confidence=30,
+                        category="openapi", asset=target, location=f"{item['method']} {item['path']}",
                         description="OpenAPI metadata indicates a potentially sensitive or unauthenticated operation; verify manually.",
                         remediation="Confirm the intended authorization model for this operation.",
                     ))
@@ -1995,11 +1936,8 @@ async def mode_ports(args, scope, client, store, engine):
         if service in {"Telnet", "Redis", "Memcached", "MongoDB", "Elasticsearch", "VNC", "RDP"}:
             sev = "MED"
         engine.add(Finding(
-            title=f"Exposed service: {service}",
-            severity=sev,
-            confidence=90,
-            category="exposed-service",
-            asset=f"{host}:{port}",
+            title=f"Exposed service: {service}", severity=sev, confidence=90,
+            category="exposed-service", asset=f"{host}:{port}",
             description=f"TCP port {port} accepted a connection; service fingerprint is {service}.",
             remediation="Restrict administrative/data-plane services to trusted networks.",
             evidence=Evidence(request=f"tcp://{host}:{port}", snippet=banner[:200]),
@@ -2034,8 +1972,7 @@ async def mode_static(args, scope, client, store, engine):
         print(f"{CYAN}[*]{RESET} Semgrep")
         try:
             p = subprocess.run(
-                ["semgrep", "--config", "p/security-audit", "--json", "--quiet",
-                 "--metrics=off", str(path)],
+                ["semgrep", "--config", "p/security-audit", "--json", "--quiet", "--metrics=off", str(path)],
                 capture_output=True, text=True, timeout=600,
             )
             data = json.loads(p.stdout or "{}")
@@ -2043,11 +1980,8 @@ async def mode_static(args, scope, client, store, engine):
                 raw_sev = str(item.get("extra", {}).get("severity", "WARNING")).upper()
                 sev = {"ERROR": "HIGH", "WARNING": "MED", "INFO": "LOW"}.get(raw_sev, "LOW")
                 engine.add(Finding(
-                    title=item.get("check_id", "Semgrep finding"),
-                    severity=sev,
-                    confidence=80,
-                    category="semgrep",
-                    asset=str(path),
+                    title=item.get("check_id", "Semgrep finding"), severity=sev, confidence=80,
+                    category="semgrep", asset=str(path),
                     location=f"{item.get('path')}:{item.get('start', {}).get('line', '')}",
                     description=item.get("extra", {}).get("message", "Semgrep finding"),
                 ))
@@ -2143,9 +2077,10 @@ async def main_async(args):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="fox",
-        description="fox — detection and recon tool",
+        description="fox — detection and recon tool with zero false positives",
     )
-    p.add_argument("mode", choices=["subdomains", "web", "ports", "static", "full", "update-cve"])
+    p.add_argument("mode", nargs="?", choices=["subdomains", "web", "ports", "static", "full", "update-cve"],
+                   help="run mode (omit for interactive)")
     p.add_argument("target", nargs="?", default="", help="authorized domain/host/URL")
     p.add_argument("--path", default=".", help="directory for static mode")
     p.add_argument("--db", default="fox.db")
@@ -2172,12 +2107,31 @@ def build_parser():
     p.add_argument("--insecure", action="store_true")
     p.add_argument("--bb", action="store_true", help="enable bug-bounty modules")
     p.add_argument("--cve-api-key", default=None, help="optional NVD API key for update-cve")
+    p.add_argument("--config", default=None, help="path to fox.yaml configuration file")
+    p.add_argument("--interactive", action="store_true", help="force interactive mode")
     return p
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.config:
+        global CONFIG
+        CONFIG = load_config(args.config)
+
+    # Interactive mode: no mode argument, or --interactive flag
+    if args.interactive or (not args.mode and not args.target):
+        if not HAS_QUESTIONARY:
+            print(f"{RED}Interactive mode requires questionary.{RESET}")
+            print("Install: python3 -m pip install questionary")
+            sys.exit(1)
+        kwargs = interactive_mode()
+        # Map interactive kwargs to argparse Namespace
+        for k, v in kwargs.items():
+            setattr(args, k, v)
+        args.mode = kwargs.get("mode", "web")
+        args.target = kwargs.get("target", "")
 
     if args.mode == "update-cve":
         cpes = [
